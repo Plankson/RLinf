@@ -37,6 +37,7 @@ class EnvOutput:
     terminations: Optional[torch.Tensor] = None  # [B]
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
+    success: Optional[torch.Tensor] = None  # [B]
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
@@ -49,6 +50,7 @@ class EnvOutput:
             else None
         )
         self.dones = self.dones.cpu().contiguous() if self.dones is not None else None
+        self.success = self.success.cpu().contiguous() if self.success is not None else None
         self.terminations = (
             self.terminations.cpu().contiguous()
             if self.terminations is not None
@@ -105,6 +107,7 @@ class EnvOutput:
         env_output_dict["terminations"] = self.terminations
         env_output_dict["truncations"] = self.truncations
         env_output_dict["rewards"] = self.rewards
+        env_output_dict["success"] = self.success
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
 
@@ -121,6 +124,7 @@ class ChunkStepResult:
     dones: torch.Tensor = None  # [B, 1]
     truncations: torch.Tensor = None  # [B, 1]
     terminations: torch.Tensor = None  # [B, 1]
+    success: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
 
@@ -131,6 +135,8 @@ class ChunkStepResult:
             self.prev_values = self.prev_values.cpu().contiguous()
         if self.dones is not None:
             self.dones = self.dones.cpu().contiguous()
+        if self.success is not None:
+            self.success = self.dones.cpu().contiguous()
         if self.terminations is not None:
             self.terminations = self.terminations.cpu().contiguous()
         if self.truncations is not None:
@@ -155,6 +161,7 @@ class Trajectory:
     intervene_flags: torch.Tensor = None
     rewards: torch.Tensor = None
     terminations: torch.Tensor = None
+    success: torch.Tensor = None
     truncations: torch.Tensor = None
     dones: torch.Tensor = None
     prev_logprobs: torch.Tensor = None
@@ -180,6 +187,9 @@ class EmbodiedRolloutResult:
         default_factory=list
     )  # trajectory_length
     rewards: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    success: list[torch.Tensor] = field(
+        default_factory=list
+    )  # trajectory_length + rollout_epoch  ???
     terminations: list[torch.Tensor] = field(
         default_factory=list
     )  # trajectory_length + rollout_epoch
@@ -212,6 +222,8 @@ class EmbodiedRolloutResult:
             self.truncations.append(result.truncations)
         if result.dones is not None:
             self.dones.append(result.dones)
+        if result.success is not None:
+            self.success.append(result.success)
         if result.prev_logprobs is not None:
             self.prev_logprobs.append(result.prev_logprobs)
         if result.prev_values is not None:
@@ -257,6 +269,8 @@ class EmbodiedRolloutResult:
             )
         if len(self.dones) > 0:
             trajectory.dones = torch.stack(self.dones, dim=0).cpu().contiguous()
+        if len(self.success) > 0:
+            trajectory.success = torch.stack(self.success, dim=0).cpu().contiguous()
         if len(self.prev_logprobs) > 0:
             trajectory.prev_logprobs = (
                 torch.stack(self.prev_logprobs, dim=0).cpu().contiguous()

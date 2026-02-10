@@ -1,0 +1,17 @@
+{
+  "os":  "Linux-4.18.0-425.3.1.el8.x86_64-x86_64-with-glibc2.35",
+  "python":  "CPython 3.11.14",
+  "startedAt":  "2026-02-04T14:24:13.066708Z",
+  "program":  "/data/users/qingyunpeng/code/RLinf/examples/sft/train_phi_from_features.py",
+  "codePath":  "examples/sft/train_phi_from_features.py",
+  "codePathLocal":  "examples/sft/train_phi_from_features.py",
+  "git":  {
+    "remote":  "https://github.com/Plankson/RLinf.git",
+    "commit":  "ea6ac333ba57d3078d823e1236a792db8219377d"
+  },
+  "email":  "3190105419@zju.edu.cn",
+  "root":  "/data/users/qingyunpeng/code/RLinf",
+  "host":  "app-40caa184494c4577bcd330b7db7b1047-68b6b64655-498mt",
+  "executable":  "/opt/venv/openvla-oft/bin/python",
+  "writerId":  "12spyr1xz0jk7j8am5uephe61wbtiug2"
+}

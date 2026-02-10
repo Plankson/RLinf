@@ -181,6 +181,7 @@ class EnvWorker(Worker):
             else None,
             rewards=chunk_rewards,
             dones=chunk_dones,
+            success=chunk_dones,
             terminations=chunk_terminations,
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
@@ -317,12 +318,13 @@ class EnvWorker(Worker):
                     )
                     terminations = dones.clone()
                     truncations = dones.clone()
-
+                    successes = dones.clone()
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         dones=dones,
                         terminations=terminations,
                         truncations=truncations,
+                        success=successes,
                         final_obs=infos["final_observation"]
                         if "final_observation" in infos
                         else None,
@@ -340,12 +342,14 @@ class EnvWorker(Worker):
                 )
                 terminations = dones.clone()
                 truncations = dones.clone()
+                successes = dones.clone()
 
                 for stage_id in range(self.stage_num):
                     env_output = EnvOutput(
                         obs=self.last_obs_list[stage_id],
                         rewards=None,
                         dones=dones,
+                        success=successes,
                         terminations=terminations,
                         truncations=truncations,
                         intervene_actions=self.last_intervened_info_list[stage_id][0],

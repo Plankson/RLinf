@@ -165,6 +165,14 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, is_openvla_model=Fa
         )
         policies.append(value_head_policy)
 
+    if hasattr(module, "phi_head"):
+        from rlinf.models.embodiment.modules.resnet_mlp import SkillHead
+
+        phi_head_policy = functools.partial(
+            _module_wrap_policy, module_classes={SkillHead}
+        )
+        policies.append(phi_head_policy)
+
     if hasattr(module, "q_head"):
         from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
 
@@ -290,11 +298,22 @@ def apply_fsdp2_to_model(
 
     modules_to_shard = []
 
+    extra_module_classes = []
+    if hasattr(module, "value_head"):
+        from rlinf.models.embodiment.modules.value_head import ValueHead
+
+        extra_module_classes.append(ValueHead)
+    if hasattr(module, "phi_head"):
+        from rlinf.models.embodiment.modules.resnet_mlp import SkillHead
+        extra_module_classes.append(SkillHead)
+    extra_module_classes = tuple(extra_module_classes)
+
+
     for name, submodule in module.named_modules():
         if submodule.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap or (
             isinstance(submodule, torch.nn.Embedding)
             and not getattr(module.config, "tie_word_embeddings", False)
-        ):
+        ) or (extra_module_classes and isinstance(submodule, extra_module_classes)):
             modules_to_shard.append((name, submodule, "transformer_or_embedding"))
 
     for name, submodule, module_type in modules_to_shard:

@@ -62,7 +62,6 @@ class LiberoEnv(gym.Env):
         self.start_idx = 0
 
         self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)()
-
         self._compute_total_num_group_envs()
         self.reset_state_ids_all = self.get_reset_state_ids_all()
         self.update_reset_state_ids()
@@ -78,6 +77,7 @@ class LiberoEnv(gym.Env):
         self.video_cfg = cfg.video_cfg
         self.video_cnt = 0
         self.render_images = []
+        self.done_list=[]
         self.current_raw_obs = None
 
     def _init_env(self):
@@ -478,18 +478,32 @@ class LiberoEnv(gym.Env):
             }
             img = raw_single_obs["agentview_image"][::-1, ::-1]
             img = put_info_on_image(img, info_item)
-            images.append(img)
-        full_image = tile_images(images, nrows=int(np.sqrt(self.num_envs)))
-        self.render_images.append(full_image)
+            # images.append(img)
+            self.render_images.append(img)
+            self.done_list.append(info_item['terminations'])
+        # full_image = tile_images(images, nrows=int(np.sqrt(self.num_envs)))
+        # self.render_images.append(full_image)
+        # self.done_list.append(info_item['terminations'])
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
         output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
-        save_rollout_video(
-            self.render_images,
-            output_dir=output_dir,
-            video_name=f"{self.video_cnt}",
-        )
+        # save_rollout_video(
+        #     self.render_images,
+        #     output_dir=output_dir,
+        #     video_name=f"{self.video_cnt}",
+        # )
+        for env_id in range(self.num_envs):
+            env_frames = np.array(self.render_images[env_id :: self.num_envs])
+            env_dones = np.array(self.done_list[env_id :: self.num_envs])
+            env_frames=env_frames[~env_dones]
+            video_name = f"{self.video_cnt}_{self.task_descriptions[env_id]}_{env_id}"
+            save_rollout_video(
+                env_frames,
+                output_dir=output_dir,
+                video_name=video_name,
+            )
         self.video_cnt += 1
         self.render_images = []
+        self.done_list = []

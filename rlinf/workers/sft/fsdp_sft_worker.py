@@ -73,6 +73,20 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                 config, framework="pytorch", shuffle=True
             )
             return data_loader, data_loader.data_config()
+
+        elif SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.QWEN2_5_VLA]:
+            from rlinf.data.datasets.libero_dataset import Config, load_rlds_dataloader
+
+            data_cfg = Config(
+                path=self.cfg.data.path,
+                batch_size=self.cfg.data.batch_size,
+                is_chunk=self.cfg.data.is_chunk,
+                chunk_size=self.cfg.data.chunk_size,
+                suffle=self.cfg.data.suffle,
+            )
+            data_loader, data_config = load_rlds_dataloader(data_cfg, split_name="train")
+            return data_loader, data_config
+
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."

@@ -15,7 +15,7 @@
 import copy
 import gc
 from typing import Any
-
+import os
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
@@ -61,8 +61,10 @@ class MultiStepRolloutWorker(Worker):
         self._sync_weight_comm_options = CollectiveGroupOptions(
             accel_max_ctas=max_ctas, accel_min_ctas=min_ctas
         )
+        self.task_id_map: dict[str, int] | None = None
 
     def init_worker(self):
+        self._load_task_id_map()
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
@@ -109,6 +111,24 @@ class MultiStepRolloutWorker(Worker):
             "max_new_tokens": self._length_params["max_new_token"],
         }
 
+    def _load_task_id_map(self):
+        intrinsic_cfg = self.cfg.reward.get("intrinsic_reward", None)
+        if not intrinsic_cfg:
+            return
+        phi_ckpt = intrinsic_cfg.get("phi_checkpoint", None)
+        if not phi_ckpt or not os.path.exists(phi_ckpt):
+            return
+        state = torch.load(phi_ckpt, map_location="cpu")
+        self.task_id_map = state["instruction2id"]
+
+    def _normalize_task_desc(self, desc: str) -> str:
+        if "_" not in desc:
+            return desc
+        base, last = desc.rsplit("_", 1)
+        if last.isdigit():
+            return base
+        return desc
+
     @Worker.timer("predict")
     def predict(self, env_obs, mode="train"):
         kwargs = (
@@ -143,6 +163,7 @@ class MultiStepRolloutWorker(Worker):
     def get_dones_and_rewards(
         self,
         env_output: dict[str, torch.Tensor],
+        ret_success: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, Any] | None]:
         """
         Get dones and rewards from environment batch, handling auto_reset if needed.
@@ -158,11 +179,16 @@ class MultiStepRolloutWorker(Worker):
             return (
                 env_output["dones"].bool().cpu().contiguous(),
                 None,
+            ) if not ret_success else (
+                env_output["dones"].bool().cpu().contiguous(),
+                None,
+                env_output['success'].bool().cpu().contiguous(),
             )
 
         dones = env_output["dones"].bool().cpu().contiguous()
         rewards = env_output["rewards"].cpu().contiguous()
-
+        if ret_success :
+            success = env_output['success'].bool().cpu().contiguous()
         # Handle auto_reset: add bootstrap value to rewards for done episodes
         # Note: currently this is not correct for chunk-size>1 with partial reset
         if dones.any() and self.cfg.env.train.auto_reset:
@@ -182,7 +208,8 @@ class MultiStepRolloutWorker(Worker):
                 # Add bootstrap value to the last step of done episodes
                 rewards[:, -1] += self.cfg.algorithm.gamma * final_values.cpu()
 
-        return dones, rewards
+        # return dones, rewards
+        return (dones, rewards) if not ret_success else (dones, rewards, success)
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
@@ -217,7 +244,7 @@ class MultiStepRolloutWorker(Worker):
             self.cfg.env.train.max_steps_per_rollout_epoch
             // self.cfg.actor.model.num_action_chunks
         )
-
+        ret_success = bool(self.cfg.reward.get("intrinsic_reward", False))
         last_obs = [None for i in range(self.num_pipeline_stages)]
         for _ in range(n_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
@@ -229,9 +256,22 @@ class MultiStepRolloutWorker(Worker):
                         env_output["intervene_flags"],
                     )
 
-                dones, rewards = self.get_dones_and_rewards(env_output)
+                dones, rewards, success = self.get_dones_and_rewards(env_output, ret_success=ret_success)
 
                 actions, result = self.predict(env_output["obs"])
+
+                task_ids = None
+                if (
+                    env_output["obs"].get("task_descriptions") is not None
+                    and self.cfg.reward.get("intrinsic_reward", None)
+                ):
+                    task_descs = env_output["obs"]["task_descriptions"]
+                    ids = []
+                    for desc in task_descs:
+                        task_id = self.task_id_map.get(desc)
+                        ids.append(task_id)
+                    task_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
+                    result["forward_inputs"]["task_ids"] = task_ids
 
                 env_output["obs"].pop("task_descriptions", None)
                 if env_output["final_obs"] is not None:
@@ -275,7 +315,7 @@ class MultiStepRolloutWorker(Worker):
                     env_output["intervene_actions"], env_output["intervene_flags"]
                 )
 
-            dones, rewards = self.get_dones_and_rewards(env_output)
+            dones, rewards, success = self.get_dones_and_rewards(env_output, ret_success=ret_success)
 
             _, result = self.predict(env_output["obs"])
 
@@ -286,6 +326,7 @@ class MultiStepRolloutWorker(Worker):
             chunk_step_result = ChunkStepResult(
                 dones=dones,
                 rewards=rewards,
+                success=success,
                 truncations=env_output["truncations"],
                 terminations=env_output["terminations"],
                 prev_logprobs=None,

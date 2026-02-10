@@ -1,0 +1,1 @@
+{"train/phi_loss":1.8199537992477417,"_runtime":18.151010447,"train/lr":2e-05,"train/contrastive_loss":0.8505083322525024,"_step":547,"_wandb":{"runtime":18},"train/supervised_value_loss":181.1513671875,"train/total_phi_loss":183.8218231201172,"_timestamp":1.770276481262489e+09}

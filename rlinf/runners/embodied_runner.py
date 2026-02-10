@@ -115,20 +115,22 @@ class EmbodiedRunner:
 
     def init_workers(self):
         # create worker in order to decrease the maximum memory usage
+        self.env.init_worker().wait()
         self.actor.init_worker().wait()
         self.rollout.init_worker().wait()
-        self.env.init_worker().wait()
 
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:
+            print("not find resume_dir")
             return
-
+        print(resume_dir)
         actor_checkpoint_path = os.path.join(resume_dir, "actor")
         assert os.path.exists(actor_checkpoint_path), (
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
         self.global_step = int(resume_dir.split("global_step_")[-1])
+        print(f"global_step={self.global_step}")
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()

@@ -96,6 +96,10 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         trust_remote_code=True,
         add_value_head=cfg.add_value_head,
         max_prompt_length=cfg.max_prompt_length,
+        add_progress_heads=getattr(cfg, "add_progress_heads", False),
+        progress_num_blocks=getattr(cfg, "progress_num_blocks", 2),
+        progress_hidden_dim=getattr(cfg, "progress_hidden_dim",  256),
+        progress_output_dim=getattr(cfg, "progress_output_dim",  4),
     )
 
     # oft add

@@ -1,0 +1,21 @@
+model_type: "qwen2.5_vla"
+
+# Path to HF Qwen2.5-VL-0.5B (vision-llm) checkpoint
+model_path: "/path/to/Qwen2.5-VL-0.5B"
+
+precision: "bf16"
+
+# action head
+action_dim: 7
+num_action_chunks: 1
+add_value_head: True
+
+# generation / prompt
+max_prompt_length: 256
+trust_remote_code: True
+
+# rollout sampling knobs
+temperature: 1.0
+top_k: -1
+top_p: 1.0
+

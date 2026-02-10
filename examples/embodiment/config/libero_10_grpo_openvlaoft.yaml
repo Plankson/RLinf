@@ -23,16 +23,16 @@ runner:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "libero_10_grpo_openvlaoft"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    logger_backends: ["wandb"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 200
   max_steps: -1
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 25
+  save_interval: 100
 
-  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  resume_dir: '/data/users/qingyunpeng/code/RLinf/logs/20260202-15:22:57-libero_10_grpo_openvlaoft/libero_10_grpo_openvlaoft/checkpoints/global_step_100' # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
@@ -88,7 +88,8 @@ env:
   
   # Override the default values in env/libero_10
   train:
-    total_num_envs: 64  # Total number of parallel environments for training
+    total_num_envs: 128  # Total number of parallel environments for training
+    group_size: 8
     max_steps_per_rollout_epoch: 512
     max_episode_steps: 512 # max episode steps for truncation
     reset_gripper_open: False
@@ -114,7 +115,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero10-traj1/"
+    model_path: "/data/users/qingyunpeng/model/openvla-oft/Openvla-oft-SFT-libero10-traj1/"
     precision: ${actor.model.precision}
 
 actor:
@@ -127,7 +128,7 @@ actor:
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero10-traj1/"
+    model_path: "/data/users/qingyunpeng/model/openvla-oft/Openvla-oft-SFT-libero10-traj1/"
     model_type: "openvla_oft"
     max_prompt_length: 128
 

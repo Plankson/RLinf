@@ -23,14 +23,14 @@ runner:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "libero_spatial_grpo_openvlaoft"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    logger_backends: ["wandb"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 200
   max_steps: -1
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 25
+  save_interval: 100
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -39,7 +39,7 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 8
-  rollout_epoch: 16
+  rollout_epoch: 8
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: action_level  # action_level or chunk_level
@@ -84,7 +84,7 @@ algorithm:
 env:
   group_name: "EnvGroup"
   enable_offload: False
-
+  
   # Override the default values in env/libero_spatial
   train:
     total_num_envs: 64
@@ -113,7 +113,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-spatial-traj1/"
+    model_path: "/data/users/qingyunpeng/model/openvla-oft/Openvla-oft-SFT-libero-spatial-traj1/"
     precision: ${actor.model.precision}
 
 actor:
@@ -126,7 +126,7 @@ actor:
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-spatial-traj1/"
+    model_path: "/data/users/qingyunpeng/model/openvla-oft/Openvla-oft-SFT-libero-spatial-traj1/"
     model_type: "openvla_oft"
 
     unnorm_key: libero_spatial_no_noops

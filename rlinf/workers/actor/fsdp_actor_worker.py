@@ -14,7 +14,8 @@
 
 import os
 from functools import partial
-
+from typing import Optional
+import torch.nn.functional as F
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -25,7 +26,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
-    kl_penalty,
+    kl_penalty, compute_v_sg, asymmetric_l2_loss
 )
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
@@ -91,6 +92,8 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
 def process_nested_dict_for_train(nested_dict, shuffle_id):
     ret_dict = {}
     for key, value in nested_dict.items():
+        if key in ['success']:
+            continue
         if key in ["dones", "terminations", "truncations", "prev_values"]:
             value = value[:-1]
         if "env_info" in key:
@@ -721,6 +724,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._sync_weight_comm_options = CollectiveGroupOptions(
             accel_max_ctas=max_ctas, accel_min_ctas=min_ctas
         )
+        
+        self.intrinsic_cfg = self.cfg.reward.get("intrinsic_reward", None)
+        self.use_intrinsic_reward = bool(self.intrinsic_cfg)
+        self.intrinsic_coef = float(self.intrinsic_cfg.get("coef", 1.0))if self.use_intrinsic_reward else 0.0
+        self._phi_heads_loaded = False
+        if self.use_intrinsic_reward:
+            self.goal_ema_decay = float(self.intrinsic_cfg.get("goal_ema_decay", 0.99))
+        self.goal_ema_table: Optional[torch.Tensor] = None
 
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
@@ -752,17 +763,207 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
 
+    def _fsdp_full_params_ctx(self, module=None, writeback: bool = False):
+        if module is None:
+            module = self.model
+        from rlinf.hybrid_engines.fsdp import FSDP
+        try:
+            return FSDP.summon_full_params(module, writeback=writeback, recurse=False)
+        except TypeError:
+            return FSDP.summon_full_params(module, writeback=writeback)
+
+    def _soft_update_target_phi(self) -> None:
+        tau = self.intrinsic_cfg.phi_target_tau
+        with torch.no_grad():
+            with self._fsdp_full_params_ctx(self.model.target_phi_head, writeback=True):
+                with self._fsdp_full_params_ctx(self.model.phi_head, writeback=False):
+                    for target_param, src_param in zip(self.model.target_phi_head.parameters(),self.model.phi_head.parameters()):
+                        target_param.data.mul_(1.0 - tau)
+                        target_param.data.add_(tau * src_param.data)
+
+
+
+    def _load_phi_heads_into_module(self, module):
+        checkpoint_path = self.intrinsic_cfg.phi_checkpoint
+        state = torch.load(checkpoint_path, map_location="cpu")
+        for attr in ("phi_head", "target_phi_head"):
+            head = getattr(module, attr)
+            head.load_state_dict(state[attr], strict=False)
+            head.to(self.device)
+        self.goal_ema_table = state["goal_phi_table"].to(self.device)
+        self._phi_heads_loaded = True
+
+    def _ema_update(self, prev: Optional[torch.Tensor], new: torch.Tensor) -> torch.Tensor:
+        if prev is None:
+            return new
+        return self.goal_ema_decay * prev + (1.0 - self.goal_ema_decay) * new
+
+    def _update_goal_ema(self, task_ids: Optional[torch.Tensor], phi_goal: torch.Tensor) -> None:
+        for task_id in torch.unique(task_ids):
+            mask = task_ids == task_id
+            mean_feat = phi_goal[mask].mean(dim=0)
+            key = int(task_id.item())
+            prev = self.goal_ema_table[key]
+            self.goal_ema_table[key] = self._ema_update(prev, mean_feat)
+    
+    def _compute_intrinsic_from_features(self, rollout_batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Compute intrinsic potential directly from cached phi features without encoder forward.
+        """
+        phi_dtype = self.model.phi_head.phi_list[0].fc1.weight.dtype
+        state_feat = rollout_batch["phi_state_features"].to(self.device, dtype=phi_dtype, non_blocking=True)
+        goal_feat = rollout_batch["phi_goal_features"].to(self.device, dtype=phi_dtype, non_blocking=True)
+
+        intrinsic_goal_mask = rollout_batch["phi_suc_mask"].to(self.device, dtype=torch.bool)
+        task_ids = rollout_batch["task_ids"]
+        task_ids = task_ids[0].view(-1).to(self.device, dtype=torch.long, non_blocking=True)
+        fail_mask = (~intrinsic_goal_mask)
+        phi_state = self.model.phi_head(state_feat, return_phi=True)
+        phi_goal = self.model.phi_head(goal_feat, return_phi=True)
+        if fail_mask.any():
+            phi_default_goal = self.goal_ema_table[task_ids[fail_mask]]
+            phi_goal[:, fail_mask, :, :] = phi_default_goal.to(dtype=phi_goal.dtype)
+        v_now = compute_v_sg(phi_state, phi_goal).mean(dim=-1)
+        #TODO: can add more transform to get reasonable intrinsic value range:
+        if self.intrinsic_cfg.get("intrinsic_reward_transform_type", False):
+            int_r = self.transform_v_function(v_now, fail_mask)
+        else:
+            int_r =  v_now
+
+        if intrinsic_goal_mask.any():
+            self._update_goal_ema(task_ids[intrinsic_goal_mask], phi_goal[0, intrinsic_goal_mask, :, :])
+
+        # rollout_batch.pop("phi_state_features")
+        # rollout_batch.pop("phi_suc_features")
+        rollout_batch.pop("phi_suc_mask")
+        return int_r.detach().cpu()
+
+    def compute_intrinsic_rewards(self, rollout_batch: dict[str, torch.Tensor]):
+        intrinsic_reward = self._compute_intrinsic_from_features(rollout_batch)
+        rewards = rollout_batch["rewards"]
+        chunk_size = rewards.shape[-1]
+        shaped = intrinsic_reward.unsqueeze(-1).expand(-1, -1, chunk_size).clone()
+        shaped[:, :, 1:] = 0.
+        mask = rollout_batch.get("loss_mask", None)
+        if mask is not None:
+            shaped = shaped * mask
+        shaped = shaped.to(rewards.dtype)
+        rollout_batch["intrinsic_rewards"] = shaped
+        rollout_batch["original_rewards"] = rewards
+        rollout_batch["rewards"] = rewards + self.intrinsic_coef * shaped
+
+    def _prepare_intrinsic_features_from_rollout(
+        self, rollout_batch: dict[str, torch.Tensor]
+    ) -> bool:
+        """
+        Use phi features cached during rollout (if available) to avoid re-forwarding the encoder.
+        """
+        phi_features = rollout_batch['forward_inputs']['phi_features']
+        rollout_batch["task_ids"] = rollout_batch['forward_inputs']["task_ids"]
+        if phi_features is None:
+            return False
+        dones_tensor = rollout_batch["dones"]
+        n_step, batch_size = phi_features.shape[0], phi_features.shape[1]
+        task_ids = rollout_batch['forward_inputs']["task_ids"]
+        task_ids = task_ids[0].view(-1)
+        task_ids = task_ids.to(phi_features.device)
+
+        # next-step features with episode boundary handling
+        dones_step = dones_tensor.any(dim=-1)
+        actual_dones_step = dones_step[:-1]
+        boundary = actual_dones_step.unsqueeze(-1)  # [n_step-1, bsz, 1]
+        next_phi = torch.roll(phi_features, shifts=-1, dims=0)
+        next_phi = torch.where(boundary, phi_features, next_phi)
+
+        # goal features: first done per trajectory (fallback to last step)
+        step_idx = torch.arange(n_step, device=phi_features.device).view(-1, 1)
+        masked_idx = torch.where(actual_dones_step, step_idx, torch.full_like(step_idx, n_step))
+        first_done_idx = masked_idx.min(dim=0).values  #[bsz,]
+        fallback_idx = torch.full_like(first_done_idx, n_step - 1)
+        last_done_idx = torch.where(first_done_idx < n_step, first_done_idx, fallback_idx)
+        batch_indices = torch.arange(batch_size, device=phi_features.device)
+        goal_feat = phi_features.transpose(0, 1)[batch_indices, last_done_idx]
+
+        rollout_batch["phi_state_features"] = phi_features.contiguous()
+        rollout_batch["phi_next_features"] = next_phi.contiguous()
+        rollout_batch["phi_goal_features"] = goal_feat.unsqueeze(0).expand_as(phi_features).contiguous()
+        step_to_goal = torch.clamp(last_done_idx.unsqueeze(0) - step_idx, min=0).unsqueeze(-1).float() 
+        rollout_batch["step_to_goal"] = step_to_goal
+
+        # success_tensor = rollout_batch['success']
+        # success_tensor = rollout_batch['success'].to(phi_features.device)
+        # success_step = (success_tensor.any(dim=-1))[:-1]
+        # masked_success = torch.where(success_step, step_idx, torch.full_like(step_idx, n_step))
+        # first_success_idx = masked_success.min(dim=0).values
+        # last_success_idx = torch.where(first_success_idx < n_step, first_success_idx, fallback_idx)
+        # success_feat = phi_features.transpose(0, 1)[batch_indices, last_success_idx]
+        # success_mask = (first_success_idx < n_step)
+        # rollout_batch["episode_success"] = episode_success.unsqueeze(0).unsqueeze(-1).repeat(n_step, 1, dones_tensor.shape[-1])
+        # rollout_batch["phi_suc_features"] = success_feat
+        # rollout_batch["phi_suc_mask"] = success_mask
+
+        # TODO: currently the done info is equal to successs info !
+        
+
+        episode_success = first_done_idx < n_step
+        rollout_batch["episode_success"] = episode_success.unsqueeze(0).unsqueeze(-1).repeat(n_step, 1, dones_tensor.shape[-1])
+        # rollout_batch["phi_suc_features"] = rollout_batch["phi_goal_features"]
+        rollout_batch["phi_suc_mask"] = episode_success
+        return True
+
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
         if model is None:
             model = super().model_provider_func()
-
+        if self.use_intrinsic_reward:
+            self._load_phi_heads_into_module(model)
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             model.load_state_dict(model_dict)
 
         return model
 
+    def save_checkpoint(self, save_path: str, global_steps: int) -> None:
+        super().save_checkpoint(save_path, global_steps)
+        if self.use_intrinsic_reward and self.goal_ema_table is not None and self._rank == 0:
+            torch.save({
+                    "goal_ema_table": self.goal_ema_table.cpu(),
+                    "goal_ema_decay": self.goal_ema_decay,
+                },
+                os.path.join(save_path, "goal_ema_table.pt"),
+            )
+
+    def load_checkpoint(self, load_path: str) -> None:
+        super().load_checkpoint(load_path)
+        if self.use_intrinsic_reward:
+            goal_ema_path = os.path.join(load_path, "goal_ema_table.pt")
+            state = torch.load(goal_ema_path, map_location="cpu")
+            table = state.get("goal_ema_table", None)
+            self.goal_ema_table = table.to(self.device)
+            self.goal_ema_decay = float(state.get("goal_ema_decay", self.goal_ema_decay))
+
+    def transform_v_function(self, v_sg: torch.tensor, fail_mask:torch.tensor) -> torch.tensor:
+        # v_sg: traj_len * batch_sz
+        breakpoint()
+        trans_type = self.intrinsic_cfg.get("intrinsic_reward_transform_type", 'default')
+        if trans_type=='default':
+            return v_sg
+        elif trans_type=='scalar_tanh_-1_to_1':
+            # return 0.1 * torch.tanh(v_sg/20.)
+            return 0.1 * torch.tanh(v_sg/100.)
+        elif trans_type=='exp_scalar_tanh_-1_to_1':
+            r = torch.tanh(v_sg/100.).max(dim=0).values
+            r = torch.exp(r)
+            r[~fail_mask] = 0
+            r = r.unsqueeze(0).expand_as(v_sg)
+            return r
+        elif trans_type=='scalar_tanh_0_to_1_total':
+            r = torch.tanh(v_sg.to(torch.float32).max(dim=0)[0])
+            r[~fail_mask] = 0
+            r = r.unsqueeze(0).expand_as(v_sg)
+            r = r/64.
+            return r 
+        
     def sync_model_to_rollout(self) -> None:
         """
         Sync the model's full state dict to the rollout worker.
@@ -814,7 +1015,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         rollout_epoch = self.cfg.algorithm.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
-
+        
+        if self.use_intrinsic_reward:
+            # Prefer cached phi features from rollout to avoid extra forward;
+            # fallback to reconstructing inputs if absent.
+            self._prepare_intrinsic_features_from_rollout(rollout_batch)
+            
         if (
             not self.cfg.env.train.auto_reset
             and not self.cfg.env.train.ignore_terminations
@@ -879,7 +1085,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             else:
                 rollout_batch["loss_mask"] = reward_filter_mask
-
+        
+        if self.use_intrinsic_reward:
+            # When offload is enabled, parameters (including phi heads) may still be on CPU
+            # because we offload right after init_worker. Load them back before using phi_head
+            # to avoid device mismatch with rollout features on GPU.
+            if self.enable_offload and self.is_weight_offloaded:
+                self.load_param_and_grad(self.device)
+            self.compute_intrinsic_rewards(rollout_batch)
         return rollout_batch
 
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
@@ -1013,7 +1226,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
-
                     with self.amp_context:
                         output_dict = self.model(
                             forward_inputs=forward_inputs,
@@ -1069,7 +1281,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
                     metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
-
+                    if self.use_intrinsic_reward:
+                        phi_head_loss, metrics_data = self._compute_phi_loss(data=batch, metrics_data=metrics_data)
+                        loss = phi_head_loss + loss
                     loss /= self.gradient_accumulation
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
@@ -1080,6 +1294,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 torch.cuda.empty_cache()
 
                 grad_norm, lr_list = self.optimizer_step()
+                if self.use_intrinsic_reward:
+                    self._soft_update_target_phi()
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1104,3 +1320,91 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
+
+
+    def _compute_phi_loss(
+        self,
+        data: dict[str, torch.Tensor],
+        metrics_data: dict[str, float],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        total_loss = 0.0
+        phi_tau = self.intrinsic_cfg.phi_expectile
+        phi_coef = self.intrinsic_cfg.phi_loss_coef
+        gamma = self.cfg.algorithm.gamma
+        s_not_goal = (data['step_to_goal']!=0.0).float()
+        phi_dtype = self.model.phi_head.phi_list[0].fc1.weight.dtype
+        phi_state_feats = data["phi_state_features"].to(dtype=phi_dtype).detach()
+        phi_next_feats = data["phi_next_features"].to(dtype=phi_dtype).detach()
+        phi_goal_feats = data["phi_goal_features"].to(dtype=phi_dtype).detach()
+        phi_s = self.model.phi_head(phi_state_feats, return_phi=True)
+        phi_goal = self.model.phi_head(phi_goal_feats, return_phi=True)
+        with torch.no_grad():
+            target_phi_s = self.model.target_phi_head(phi_state_feats, return_phi=True)
+            target_phi_next = self.model.target_phi_head(phi_next_feats, return_phi=True)
+            target_phi_goal = self.model.target_phi_head(phi_goal_feats, return_phi=True)
+            v_sg_t = compute_v_sg(target_phi_s, target_phi_goal)
+            v_next_t = compute_v_sg(target_phi_next, target_phi_goal)
+            v_sg_mean = v_sg_t.mean(dim=1, keepdim=True)
+            target_q = -s_not_goal + s_not_goal * gamma * v_next_t.min(dim=1, keepdim=True).values
+            adv = target_q - v_sg_mean
+        mask_phi = data["loss_mask"]
+        mask_phi = mask_phi.any(dim=-1, keepdim=True).float()
+
+        q = -s_not_goal + s_not_goal * gamma * v_next_t
+        v_sg = compute_v_sg(phi_s, phi_goal)
+        phi_loss = asymmetric_l2_loss(adv, q - v_sg, phi_tau)
+        phi_loss = phi_loss * mask_phi if mask_phi is not None else phi_loss
+        phi_loss = phi_loss.mean()
+        total_loss = total_loss + phi_coef * phi_loss
+
+        metrics_data.update({
+            "phi/iql_loss": phi_loss.detach().item(),
+            "phi/v_mean": v_sg.detach().mean().item(),
+            "phi/v_max": v_sg.detach().max().item(),
+            "phi/v_min": v_sg.detach().min().item(),
+            "phi/q": q.detach().mean().item(),
+            "phi/adv": adv.detach().mean().item(),
+        })
+
+        #contrasitive loss
+        if "task_ids" in data:
+            contrast_coef = self.intrinsic_cfg.get("contrastive_coef", 0.0)
+            contrast_temp = self.intrinsic_cfg.get("contrastive_temp", 0.1)
+            if contrast_coef > 0:
+                task_ids = data["task_ids"].to(phi_goal.device)
+                success_flags = data["episode_success"]
+                success_flags = success_flags.any(dim=-1).to(phi_goal.device).bool() 
+                goal_emb = phi_goal.mean(dim=1)
+                goal_emb = F.normalize(goal_emb, p=2, dim=-1)
+                sim_matrix = torch.matmul(goal_emb, goal_emb.transpose(0, 1)) / contrast_temp
+                mask_pos = (task_ids.unsqueeze(1) == task_ids.unsqueeze(0)).float()
+                success_mat = success_flags.unsqueeze(1) * success_flags.unsqueeze(0)
+                mask_pos = mask_pos * success_mat.float()
+                mask_pos.fill_diagonal_(0.0)
+                exp_sim = torch.exp(sim_matrix)
+                valid_mask = mask_pos.sum(dim=1) > 0
+                self_sim = torch.exp(torch.diagonal(sim_matrix, 0))
+                pos_sum = (exp_sim * mask_pos).sum(dim=1)
+                numerator = torch.where(valid_mask, pos_sum, self_sim)
+                neg_mask = 1.0 - mask_pos
+                neg_mask.fill_diagonal_(0.0)
+                neg_sum = (exp_sim * neg_mask).sum(dim=1)
+                denominator = numerator + neg_sum + 1e-8
+                loss_i = -torch.log(numerator / denominator)
+                contrast_loss = loss_i.mean()
+                total_loss = total_loss + contrast_coef * contrast_loss
+                metrics_data["phi/contrast_loss"] = contrast_loss.detach().item()
+                # writer.add_image('similarity_matrix', a.unsqueeze(0).unsqueeze(0), global_step=0)
+                # metrics_data["contrast/mean_sim_all"] = sim_matrix.detach().mean().item()
+        
+        # supvervised loss
+        if 'step_to_goal' in data:
+            supv_coef = self.intrinsic_cfg.get("supervised_coef", 0.0)
+            if supv_coef > 0:
+                step_to_goal = data['step_to_goal'].to(phi_goal.device).to(v_sg.dtype)
+                supv_loss = F.mse_loss(v_sg.mean(dim=-1, keepdim=True), -step_to_goal)
+                total_loss = total_loss + supv_coef * supv_loss
+                metrics_data["phi/supervised_loss"] = supv_loss.detach().item()
+
+        metrics_data['phi/total_loss'] = total_loss.detach().item()
+        return total_loss, metrics_data

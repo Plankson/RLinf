@@ -22,6 +22,13 @@ def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
         error.abs() < delta, 0.5 * error**2, delta * (error.abs() - 0.5 * delta)
     )
 
+def compute_v_sg(phi_state: torch.Tensor, phi_goal: torch.Tensor) -> torch.Tensor:
+    dist = (phi_state - phi_goal).pow(2).sum(dim=-1)
+    return -torch.sqrt(dist.clamp(min=1e-6))
+
+def asymmetric_l2_loss(u: torch.Tensor, diff: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+    return torch.abs(tau - (u < 0).float()) * diff**2
+
 
 def kl_penalty(
     logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty

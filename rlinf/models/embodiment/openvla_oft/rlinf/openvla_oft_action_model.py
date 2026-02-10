@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from typing import Any, Optional
-
+import copy
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -32,6 +32,7 @@ from transformers.generation import TopKLogitsWarper
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.modules.resnet_mlp import *
 from rlinf.utils.utils import (
     compute_entropy_from_logits,
     compute_logprobs_from_logits,
@@ -46,6 +47,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         num_action_chunks,
         add_value_head,
         max_prompt_length,
+        add_progress_heads: bool = False,
+        progress_num_blocks: int = 2,
+        progress_hidden_dim: int = 32,
+        progress_output_dim: int = 4,
     ) -> None:
         super().__init__(config)
 
@@ -74,6 +79,18 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
                 activation="gelu",
                 bias_last=False,
             )
+        self.add_progress_heads = add_progress_heads
+        if self.add_progress_heads:
+            self.hidden_size = self.config.hidden_size
+            head_num = getattr(config, "progress_head_num", 2)
+            self.phi_head = SkillHead(
+                input_dim=self.hidden_size,
+                hidden_dim=progress_hidden_dim,
+                num_blocks=progress_num_blocks,
+                output_dim=progress_output_dim,
+                head_num=head_num,
+            )
+            self.target_phi_head = copy.deepcopy(self.phi_head)
 
         self.max_prompt_length = max_prompt_length
 
@@ -408,7 +425,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         action_logits[..., self.vocab_size :] = -torch.inf
 
         chunk_logprobs = compute_logprobs_from_logits(logits=action_logits, target=idxs)
-
+        phi_features = last_hidden_states[:, 0, :]    
         if hasattr(self, "value_head") and calculate_values:
             hidden_features = last_hidden_states[
                 :, -self.action_dim * self.num_action_chunks
@@ -422,6 +439,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         chunk_action_tokens = idxs.reshape(-1, self.num_action_chunks, self.action_dim)
 
         forward_inputs["action_tokens"] = chunk_action_tokens
+        forward_inputs["phi_features"] = phi_features
 
         result = {
             "prev_logprobs": chunk_logprobs,
@@ -471,6 +489,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         compute_logprobs: bool = False,
         compute_entropy: bool = False,
         compute_values: bool = False,
+        compute_iql: bool = False,
         use_cache: Optional[bool] = None,
         **kwargs,
     ):
@@ -507,7 +526,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )
         multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
 
-        if compute_values:
+        if compute_values or compute_iql:
             output_hidden_states = True
 
         # Forward pass through language model
@@ -565,10 +584,76 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         else:
             values = None
 
+        if compute_iql and self.add_progress_heads:
+            last_hidden_state = outputs.hidden_states[-1]
+            hidden_features = last_hidden_state[
+                :, -self.action_dim * self.num_action_chunks - 1
+            ]  # [batch_size, hidden_dim]
+            phi_list_embed = self.phi_head(hidden_features, return_phi=True)
+            target_phi_list_embed = (self.target_phi_head(hidden_features, return_phi=True).detach())
+        else:
+            phi_list_embed = None
+            target_phi_list_embed = None
         result = {
             "logprobs": logprobs,
             "entropy": entropy,
             "values": values,
+            "phi_list_embed": phi_list_embed,
+            "target_phi_list_embed": target_phi_list_embed,
         }
 
         return result
+
+    def encode_features(
+            self,
+            input_ids: torch.LongTensor,
+            attention_mask: torch.Tensor,
+            pixel_values: torch.FloatTensor,
+        ) -> torch.Tensor:
+            """
+            Run the multimodal encoder and return the hidden feature corresponding
+            to the first action token placeholder (same position used by value head).
+            """
+            # append placeholder action tokens + stop token
+            input_ids, attention_mask = self._prepare_input_for_action_prediction(
+                input_ids, attention_mask
+            )
+            assert torch.all(input_ids[:, -1] == STOP_INDEX)
+            assert torch.all(
+                attention_mask[:, -2 - self.action_dim * self.num_action_chunks :] == 1
+            )
+
+            mm_embeddings, mm_attention_mask = self._build_embedding(
+                input_ids, attention_mask, pixel_values
+            )
+            multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
+            outputs = self.language_model(
+                input_ids=None,
+                attention_mask=mm_attention_mask,
+                position_ids=multimodal_position_ids,
+                inputs_embeds=mm_embeddings,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden = outputs.hidden_states[-1]  # [B, seq, D]
+            features = last_hidden[:, -self.action_dim * self.num_action_chunks - 1]
+            return features
+
+    def get_phi_embeddings(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
+        output_target: bool=False,
+    ):
+        """
+        Convenience wrapper to compute phi embeddings (all heads) for arbitrary inputs.
+        """
+        features = self.encode_features(input_ids, attention_mask, pixel_values)
+        if not output_target:
+            return self.phi_head(features, return_phi=True)
+        return (
+            self.phi_head(features, return_phi=True),
+            self.target_phi_head(features, return_phi=True),
+        )
